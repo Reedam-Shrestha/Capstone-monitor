@@ -9,7 +9,7 @@
 typedef struct {
     int      pid;
     char     comm[17];          /* process name, max 16 chars + null */
-    int      uid;               /* from /proc/PID/status */
+    int      uid;               /* from /proc/PID/status; -1 = not yet read */
     uint64_t utime;             /* user-mode CPU ticks (from stat) */
     uint64_t stime;             /* kernel-mode CPU ticks (from stat) */
     uint64_t total_ticks;       /* utime + stime */

@@ -21,7 +21,7 @@ typedef struct {
     uint64_t id_instr;
     uint64_t id_llc;
     /* NOTE: per-interval delta tracking (prev_cycles etc.) lives in
-     * PidState / CorePrev in monitor_final.h — not here.  The fields
+     * PidState / CorePrev in schedmon.h — not here.  The fields
      * that used to be here were never written by perf_counter.c and
      * caused confusion about where the canonical baseline lives. */
 } perf_counter_t;
@@ -35,9 +35,10 @@ int    perf_counter_open (perf_counter_t *pc, pid_t pid, int cpu_id);
 int    perf_counter_read (perf_counter_t *pc, raw_counters_t *out);
 void   perf_counter_close(perf_counter_t *pc);
 
-double perf_counter_ipc          (const raw_counters_t *cur,
-                                  const raw_counters_t *prev);
-double perf_counter_llc_miss_rate(const raw_counters_t *cur,
-                                  const raw_counters_t *prev);
+/* NOTE: perf_counter_ipc() and perf_counter_llc_miss_rate() were removed.
+ * IPC and LLC miss rate are computed inline in schedmon.c using raw
+ * counter deltas.  The helper functions returned stale single-point values
+ * (not window-smoothed) and perf_counter_llc_miss_rate returned percent
+ * while the ring buffer field smoothed_llc_miss is a fraction — inconsistent. */
 
 #endif /* PERF_COUNTER_H */

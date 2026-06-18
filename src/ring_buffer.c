@@ -90,6 +90,20 @@ void rb_destroy_dash(RingBuffer *rb) {
     rb_destroy_named(rb, SHM_NAME_DASH);
 }
 
+/* ── public API — scheduler buffer (/monitor_rb_sched) ──────────────────── */
+
+RingBuffer *rb_create_sched(void) {
+    return rb_create_named(SHM_NAME_SCHED);
+}
+
+RingBuffer *rb_attach_sched(void) {
+    return rb_attach_named(SHM_NAME_SCHED);
+}
+
+void rb_destroy_sched(RingBuffer *rb) {
+    rb_destroy_named(rb, SHM_NAME_SCHED);
+}
+
 /* ── shared: detach without unlinking ───────────────────────────────────── */
 
 void rb_detach(RingBuffer *rb) {

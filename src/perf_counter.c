@@ -113,7 +113,11 @@ int perf_counter_read(perf_counter_t *pc, raw_counters_t *out) {
     /* Hardware path: grouped atomic read of all three counters */
     struct read_format buf;
     ssize_t n = read(pc->fd_cycles, &buf, sizeof(buf));
-    if (n <= 0)
+    /* Reject short reads: if we can't even read the 'nr' field (8 bytes),
+     * buf.nr is garbage and the loop below would iterate arbitrary times.
+     * perf grouped reads are atomic in the kernel so a short read indicates
+     * a real fd error, not a partial transfer. */
+    if (n < (ssize_t)sizeof(uint64_t))
         return -1;
 
     for (uint64_t i = 0; i < buf.nr && i < 3; i++) {
@@ -127,21 +131,10 @@ int perf_counter_read(perf_counter_t *pc, raw_counters_t *out) {
     return 0;
 }
 
-double perf_counter_ipc(const raw_counters_t *cur,
-                        const raw_counters_t *prev) {
-    uint64_t cycles = prev ? cur->cycles       - prev->cycles       : cur->cycles;
-    uint64_t instr  = prev ? cur->instructions - prev->instructions : cur->instructions;
-    if (cycles == 0) return 0.0;
-    return (double)instr / (double)cycles;
-}
-
-double perf_counter_llc_miss_rate(const raw_counters_t *cur,
-                                  const raw_counters_t *prev) {
-    uint64_t instr = prev ? cur->instructions - prev->instructions : cur->instructions;
-    uint64_t llc   = prev ? cur->llc_misses   - prev->llc_misses   : cur->llc_misses;
-    if (instr == 0) return 0.0;
-    return 100.0 * (double)llc / (double)instr;
-}
+/* perf_counter_ipc() and perf_counter_llc_miss_rate() removed — dead code.
+ * Both were never called from the sampling loop.  IPC and LLC miss rate
+ * are computed inline in schedmon.c for correctness (window smoothing,
+ * correct fraction vs percent semantics). */
 
 void perf_counter_close(perf_counter_t *pc) {
     if (pc->fd_cycles >= 0) {

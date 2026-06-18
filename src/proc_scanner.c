@@ -93,6 +93,7 @@ static ProcEntry *find_or_alloc(ProcScanner *ps, int pid, int *is_new) {
     ProcEntry *e = &ps->entries[ps->n_entries++];
     memset(e, 0, sizeof(*e));
     e->pid = pid;
+    e->uid = -1;   /* sentinel: not yet read; 0 is valid (root) */
     *is_new = 1;
     return e;
 }
@@ -130,7 +131,7 @@ void proc_scanner_scan_pids(ProcScanner *ps, const uint32_t *pids, int num_pids)
         e->delta_ticks  = (tmp.total_ticks > e->prev_ticks) ? tmp.total_ticks - e->prev_ticks : 0;
         e->active       = 1;
 
-        if (e->uid == 0 && pid > 1 && is_new)
+        if (e->uid == -1 && pid > 1)
             e->uid = read_proc_uid(pid);
     }
 
@@ -177,7 +178,7 @@ void proc_scanner_scan(ProcScanner *ps) {
         e->delta_ticks  = (tmp.total_ticks > e->prev_ticks) ? tmp.total_ticks - e->prev_ticks : 0;
         e->active       = 1;
 
-        if (e->uid == 0 && pid > 1 && is_new)
+        if (e->uid == -1 && pid > 1)
             e->uid = read_proc_uid(pid);
     }
     closedir(dir);
