@@ -1,9 +1,9 @@
-# Capstone Monitor — Real-Time Performance Monitoring Daemon
+# schedmon — Real-Time Performance Monitoring Daemon
 
-A low-overhead (**<5% CPU**) Linux performance monitoring daemon that collects
-hardware performance counters (IPC, LLC miss rate) and software events
-(context switches, block I/O) per process, then exports smoothed metrics
-via a lock-free shared-memory ring buffer for workload classification.
+A low-overhead Linux performance monitoring daemon that collects hardware
+performance counters and kernel-traced software events per process, smooths
+them over a 500ms sliding window, and exports metrics via three lock-free
+shared-memory ring buffers for workload classification and scheduler selection.
 
 Part of the **"Workload-Aware Linux Resource Management Framework"** capstone project.
 
@@ -12,47 +12,80 @@ Part of the **"Workload-Aware Linux Resource Management Framework"** capstone pr
 ## Architecture
 
 ```
-┌─────────────┐  perf_event_open  ┌────────────────┐
-│  Linux PMU  │◄──────────────────│ monitor_final  │
-│  eBPF progs │◄── bpf() syscall ─│  (C daemon)    │
-└─────────────┘                   │                │
-                                  │  ┌──────────┐  │
-                                  │  │ Sliding  │  │
-                                  │  │ Windows  │  │
-                                  │  └────┬─────┘  │
-                                  │       │        │
-                                  │  ┌────▼─────┐  │
-                                  │  │  Ring    │  │
-                                  │  │  Buffer  │  │
-                                  │  │  (shm)   │  │
-                                  │  └────┬─────┘  │
-                                  └───────┼────────┘
-                                          │
-             ┌────────────────────────────┼─────────────────────────┐
-             │                            │                         │
-  ┌──────────▼──────┐           ┌─────────▼────────┐         ┌──────▼──────┐
-  │   Classifier    │           │    Dashboard     │         │ ghOSt Agent │
-  │  (C / Python)   │           │    (Python)      │         │    (C)      │
-  └─────────────────┘           └──────────────────┘         └─────────────┘
+┌─────────────┐  perf_event_open  ┌─────────────────────────────────┐
+│  Linux PMU  │◄──────────────────│           schedmon              │
+│  eBPF progs │◄── bpf() syscall ─│          (C daemon)             │
+└─────────────┘                   │                                 │
+                                  │  perf counters → SlidingWindow  │
+                                  │  eBPF maps     → SlidingWindow  │
+                                  │  /proc/PID/io  → SlidingWindow  │
+                                  │                                 │
+                                  │  ┌──────────────────────────┐   │
+                                  │  │     3 Ring Buffers       │   │
+                                  │  │  /monitor_rb        (agg)│   │
+                                  │  │  /monitor_rb_dash   (all)│   │
+                                  │  │  /monitor_rb_sched  (pc) │   │
+                                  │  └────────────┬─────────────┘   │
+                                  └───────────────┼─────────────────┘
+                                                  │
+             ┌────────────────────────────────────┼──────────────────────┐
+             │                                    │                      │
+  ┌──────────▼──────┐                  ┌──────────▼───────┐    ┌────────▼──────┐
+  │   Classifier    │                  │    Dashboard     │    │  ghOSt Agent  │
+  │  (reads /agg)   │                  │  (reads /all)    │    │ (reads /pc)   │
+  └─────────────────┘                  └──────────────────┘    └───────────────┘
 ```
+
+---
+
+## Metrics Collected (ABI v4)
+
+Each ring buffer slot is a `SmoothedMetrics` struct (72 bytes, 8-byte aligned):
+
+| Field | Source | Description |
+|---|---|---|
+| `smoothed_ipc` | perf PMU | Instructions per cycle (500ms window) |
+| `smoothed_llc_miss` | perf PMU | LLC miss rate as fraction of instructions |
+| `smoothed_ctx_freq` | eBPF sched_switch | Voluntary context switches/sec |
+| `smoothed_io_freq` | /proc/PID/io | Disk bytes/sec (read + write − cancelled) |
+| `smoothed_io_wait_ms` | eBPF block_rq | Avg block I/O latency ms (direct I/O) |
+| `smoothed_rq_wait_ms` | eBPF sched_wakeup | Avg runqueue wait ms per wakeup |
+| `smoothed_migration_freq` | eBPF pid_last_cpu | Core migrations/sec |
+
+`smoothed_migration_freq` is the primary signal for scheduler instability —
+high values mean the process is being bounced across cores, destroying cache
+locality. Does not require per-core perf fds; works with `--no-per-core`.
+
+---
+
+## Ring Buffers
+
+| Path | Consumers | Contents |
+|---|---|---|
+| `/dev/shm/monitor_rb` | Classifier | Aggregate only (`cpu_id == -1`) |
+| `/dev/shm/monitor_rb_dash` | Dashboard | Aggregate + per-core |
+| `/dev/shm/monitor_rb_sched` | ghOSt agent | Per-core only (`cpu_id >= 0`) |
+
+Capacity: 32768 slots each. Lock-free SPSC. Slots are 72 bytes.
+Classifier should only read `/monitor_rb`.
 
 ---
 
 ## Quick Install
 
 ```bash
-git clone https://github.com/Reedam-Shrestha/capstone_monitor.git
-cd capstone_monitor/final
+git clone https://github.com/Reedam-Shrestha/schedmon.git
+cd schedmon
 sudo ./install.sh
 ```
 
-> Builds, installs, calibrates thresholds, and starts the daemon in **one command**.
+> Builds, installs, calibrates thresholds, and starts the daemon in one command.
 
 ---
 
 ## Manual Install
 
-### 1. Install Dependencies
+### 1. Dependencies
 
 ```bash
 sudo apt update
@@ -71,19 +104,20 @@ make clean && make
 
 ```bash
 sudo make install
+sudo cp schedmon.service /etc/systemd/system/
 sudo systemctl daemon-reload
 ```
 
-### 4. Calibrate *(REQUIRED)*
+### 4. Calibrate *(required — derives classifier thresholds for this hardware)*
 
 ```bash
-sudo python3 /opt/capstone_monitor/scripts/calibrate.py --duration 30
+sudo python3 /opt/schedmon/calibrate.py --duration 30
 ```
 
 ### 5. Start
 
 ```bash
-sudo systemctl enable --now capstone_monitor
+sudo systemctl enable --now schedmon
 ```
 
 ---
@@ -91,22 +125,19 @@ sudo systemctl enable --now capstone_monitor
 ## Usage
 
 ```bash
-# View live dashboard
-python3 /opt/capstone_monitor/scripts/dashboard.py
+# Live dashboard
+python3 /opt/schedmon/dashboard.py
 
-# View daemon logs
-journalctl -u capstone_monitor -f
+# Daemon logs
+journalctl -u schedmon -f
 
-# Run manually (stop the service first)
-sudo systemctl stop capstone_monitor
-sudo /opt/capstone_monitor/monitor_final /opt/capstone_monitor/bpf/ctx_switch.bpf.o \
+# Run manually (stop service first)
+sudo systemctl stop schedmon
+sudo /opt/schedmon/schedmon /opt/schedmon/bpf/ctx_switch.bpf.o \
     --top 20 --terminal
 
-# Measure overhead
-sudo ./tests/validate_overhead.sh 60
-
 # Recalibrate after hardware changes
-sudo python3 /opt/capstone_monitor/scripts/calibrate.py --duration 30
+sudo python3 /opt/schedmon/calibrate.py --duration 30
 ```
 
 ---
@@ -114,92 +145,73 @@ sudo python3 /opt/capstone_monitor/scripts/calibrate.py --duration 30
 ## CLI Options
 
 | Flag | Description |
-|------|-------------|
-| `--top N` | Monitor top N processes by CPU (default: 50) |
-| `--pids P1,P2` | Monitor specific PIDs |
-| `--all` | Monitor all user processes |
-| `--interval MS` | Sample interval in ms (default: 50) |
-| `--csv FILE` | Write raw samples to CSV |
-| `--per-core` | Enable per-core counter tracking |
-| `--cores N,M` | Monitor only specific cores |
-| `--terminal` | Print live table to terminal |
-| `--quiet` | Suppress non-error output |
-| `--version` | Print build info and exit |
+|---|---|
+| `--top N` | Monitor top N processes by CPU (default: 256 = all) |
+| `--pids P1,P2` | Monitor specific PIDs explicitly |
+| `--interval MS` | Sample interval ms (default: 50) |
+| `--no-per-core` | Disable per-core counters (use on VMs without hardware PMU) |
+| `--csv FILE` | Write samples to CSV (calibration use) |
+| `--label STR` | Workload label written to CSV (for classifier training) |
+| `--min-uid UID` | Only monitor processes with uid >= UID (default: 0) |
+| `--terminal` | Print live table to stdout |
+| `--zero, -z` | Show idle/zero-value processes (hidden by default) |
 
 ---
 
 ## File Structure
 
 ```
-Capstone-monitor/
-└── final/
-    ├── Makefile                       # Build system
-    ├── install.sh                     # One-command installer (chmod +x)
-    ├── README.md                      # This file
-    ├── dashboard.py                   # Rich terminal dashboard
-    ├── calibrate.py                   # Auto-calibration script
-    ├── capstone_monitor.service       # systemd unit file
-    ├── src/
-    │   ├── monitor_final.c            # Main daemon
-    │   ├── monitor_final.h
-    │   ├── perf_counter.c             # perf_event_open wrapper
-    │   ├── perf_counter.h
-    │   ├── ebpf_tracer.c              # libbpf wrapper
-    │   ├── ebpf_tracer.h
-    │   ├── proc_scanner.c             # /proc PID scanner
-    │   ├── proc_scanner.h
-    │   ├── ring_buffer.c              # Lock-free SPSC ring buffer
-    │   ├── ring_buffer.h
-    │   ├── sliding_window.c           # Sliding window aggregation
-    │   ├── sliding_window.h
-    │   └── smoothed_metrics.h         # Shared struct definition
-    ├── bpf/
-    │   └── ctx_switch.bpf.c           # eBPF program
-    └── tests/
-        └── validate_overhead.sh       # Overhead measurement script
+schedmon/
+├── Makefile
+├── schedmon.service          # systemd unit file
+├── README.md
+├── dashboard.py              # Rich terminal dashboard
+├── calibrate.py              # Hardware-adaptive threshold calibration
+├── src/
+│   ├── schedmon.c            # Main daemon
+│   ├── schedmon.h            # PidState, DaemonConfig, constants
+│   ├── smoothed_metrics.h    # SmoothedMetrics struct (ABI v4, 72 bytes)
+│   ├── perf_counter.c/h      # perf_event_open wrapper
+│   ├── ebpf_tracer.c/h       # libbpf wrapper + BPF map readers
+│   ├── proc_scanner.c/h      # /proc PID scanner and CPU ranker
+│   ├── ring_buffer.c/h       # Lock-free SPSC ring buffer (3 instances)
+│   └── sliding_window.c/h    # N=10 sample sliding window (SWAG, 500ms)
+└── bpf/
+    └── ctx_switch.bpf.c      # eBPF: sched, block I/O, fork/exit tracepoints
 ```
 
 ---
 
-## Push to GitHub
+## For Classifier / ghOSt Consumers
 
-```bash
-cd Capstone-monitor
-git add final/Makefile final/install.sh final/README.md final/tests/
-git commit -m "Add build system, installer, and documentation"
-git push
+Include `smoothed_metrics.h` and check ABI at compile time:
+
+```c
+#include "smoothed_metrics.h"
+_Static_assert(MONITOR_ABI_VERSION == 4, "recompile against updated smoothed_metrics.h");
 ```
 
----
+Attach to the ring buffer:
 
-## Installing From GitHub
-
-After pushing, anyone can install with:
-
-```bash
-git clone https://github.com/Reedam-Shrestha/capstone_monitor.git
-cd capstone_monitor/final
-sudo ./install.sh
+```c
+RingBuffer *rb = rb_attach();   // /monitor_rb — aggregate only
+SmoothedMetrics m;
+while (rb_pop(rb, &m)) {
+    // m.smoothed_ipc, m.smoothed_llc_miss, m.smoothed_migration_freq ...
+}
+rb_detach(rb);
 ```
 
----
-
-## systemd Service
-
-The service unit uses `Type=notify`. Ensure the `ExecStart` line in
-`capstone_monitor.service` reads:
-
-```ini
-ExecStart=/opt/capstone_monitor/monitor_final /opt/capstone_monitor/bpf/ctx_switch.bpf.o \
-    --all --top 50 --interval 50 --quiet
-```
-
-> The `--quiet` flag keeps the journal clean in production.
+`cpu_id == -1` means aggregate entry (what the classifier should use).
+`cpu_id >= 0` means per-core entry (for ghOSt agent via `/monitor_rb_sched`).
 
 ---
 
 ## Uninstall
 
 ```bash
-sudo make uninstall
+sudo systemctl disable --now schedmon
+sudo rm -rf /opt/schedmon
+sudo rm /etc/systemd/system/schedmon.service
+sudo systemctl daemon-reload
 ```
