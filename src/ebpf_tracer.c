@@ -157,35 +157,37 @@ int ebpf_tracer_attach(ebpf_tracer_t *et) {
 }
 
 /* ── readers ────────────────────────────────────────────────────────────── */
-
 uint64_t ebpf_tracer_read_switches(const ebpf_tracer_t *et, uint32_t pid) {
     if (et->map_fd_switches < 0) return 0;
     uint64_t v = 0;
-    bpf_map_lookup_elem(et->map_fd_switches, &pid, &v);
+    int ret = bpf_map_lookup_elem(et->map_fd_switches, &pid, &v);
+    if (ret < 0) return 0;
     return v;
 }
 
 uint64_t ebpf_tracer_read_io(const ebpf_tracer_t *et, uint32_t pid) {
     if (et->map_fd_io < 0) return 0;
     uint64_t v = 0;
-    bpf_map_lookup_elem(et->map_fd_io, &pid, &v);
+    int ret = bpf_map_lookup_elem(et->map_fd_io, &pid, &v);
+    if (ret < 0) return 0;
     return v;
 }
 
 uint64_t ebpf_tracer_read_io_wait_ns(const ebpf_tracer_t *et, uint32_t pid) {
     if (et->map_fd_io_wait < 0) return 0;
     uint64_t v = 0;
-    bpf_map_lookup_elem(et->map_fd_io_wait, &pid, &v);
+    int ret = bpf_map_lookup_elem(et->map_fd_io_wait, &pid, &v);
+    if (ret < 0) return 0;
     return v;
 }
 
 uint64_t ebpf_tracer_read_rq_wait_ns(const ebpf_tracer_t *et, uint32_t pid) {
     if (et->map_fd_rq_wait < 0) return 0;
     uint64_t v = 0;
-    bpf_map_lookup_elem(et->map_fd_rq_wait, &pid, &v);
+    int ret = bpf_map_lookup_elem(et->map_fd_rq_wait, &pid, &v);
+    if (ret < 0) return 0;
     return v;
 }
-
 /*
  * ebpf_tracer_read_last_cpu — returns the last CPU id where pid ran,
  * or -1 if the map is unavailable or the pid has no entry yet.

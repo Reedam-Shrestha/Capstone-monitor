@@ -34,6 +34,38 @@ CAP                 = 32768  # RB_CAPACITY
 
 SHM_PATH = "/dev/shm/monitor_rb_dash"
 
+# Trailing ABI header written once by rb_create*() in ring_buffer.c (H1 fix).
+# Offsets must match the RingBuffer struct layout exactly:
+#   slots[CAP] | head (4B) | tail (4B) | abi_version (4B) | slot_size (4B)
+_SLOTS_SZ      = SLOT * CAP
+_ABI_OFF       = _SLOTS_SZ + 8
+_SLOT_SIZE_OFF = _SLOTS_SZ + 12
+
+_abi_warned = False
+
+def check_shm_abi(mm) -> bool:
+    """
+    Validate the live shm segment was created by a producer compiled
+    against this same smoothed_metrics.h.  Prints once on mismatch
+    (not every refresh) and returns False so callers can decide whether
+    to keep reading (degraded) or bail.
+    """
+    global _abi_warned
+    try:
+        live_abi  = int.from_bytes(mm[_ABI_OFF:_ABI_OFF+4], 'little')
+        live_slot = int.from_bytes(mm[_SLOT_SIZE_OFF:_SLOT_SIZE_OFF+4], 'little')
+    except Exception:
+        return True  # segment too small (older daemon, pre-H1-fix) — skip, don't false-alarm
+
+    ok = (live_abi == MONITOR_ABI_VERSION) and (live_slot == SLOT)
+    if not ok and not _abi_warned:
+        print(f"[dashboard] ABI MISMATCH: shm created with abi={live_abi} "
+              f"slot={live_slot}B; dashboard.py expects abi={MONITOR_ABI_VERSION} "
+              f"slot={SLOT}B. Data below may be misread — rebuild/redeploy "
+              f"the matching dashboard.py.", file=sys.stderr)
+        _abi_warned = True
+    return ok
+
 class SmoothedMetrics(ctypes.Structure):
     _fields_ = [
         ("pid",                    ctypes.c_int),
@@ -134,6 +166,12 @@ def drain_ring_buffer() -> Dict[int, SmoothedMetrics]:
         os.close(fd)
     except Exception:
         return result
+
+    # H1 fix: validate the daemon that created this segment matches the
+    # ABI this script was written against. Warns once on mismatch; does
+    # not block reading (a misread sample is preferable to a dead dashboard,
+    # but the warning makes the misread visible instead of silent).
+    check_shm_abi(mm)
 
     try:
         head_off = slots_sz

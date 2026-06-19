@@ -91,7 +91,7 @@ int handle_sched_switch(struct sched_switch_args *ctx) {
     if (prev_pid != 0 && ctx->prev_state != 0) {
         __u64 *cnt = bpf_map_lookup_elem(&vol_ctx_switches, &prev_pid);
         if (cnt) {
-            __sync_fetch_and_add(cnt, 1);
+            __atomic_fetch_add(cnt, 1, __ATOMIC_RELAXED);
         } else {
             __u64 one = 1;
             bpf_map_update_elem(&vol_ctx_switches, &prev_pid, &one, BPF_ANY);
@@ -106,7 +106,7 @@ int handle_sched_switch(struct sched_switch_args *ctx) {
         if (wait < 10000000000ULL) {
             __u64 *acc = bpf_map_lookup_elem(&rq_wait_ns, &next_pid);
             if (acc) {
-                __sync_fetch_and_add(acc, wait);
+                __atomic_fetch_add(acc, wait, __ATOMIC_RELAXED);
             } else {
                 bpf_map_update_elem(&rq_wait_ns, &next_pid, &wait, BPF_ANY);
             }
@@ -293,7 +293,7 @@ int handle_block_rq_complete(struct bpf_raw_tracepoint_args *ctx) {
 
     __u64 *cnt = bpf_map_lookup_elem(&io_counts, &pid);
     if (cnt) {
-        __sync_fetch_and_add(cnt, 1);
+        __atomic_fetch_add(cnt, 1, __ATOMIC_RELAXED);
     } else {
         __u64 one = 1;
         bpf_map_update_elem(&io_counts, &pid, &one, BPF_ANY);
@@ -304,7 +304,7 @@ int handle_block_rq_complete(struct bpf_raw_tracepoint_args *ctx) {
         if (wait < 30000000000ULL) {
             __u64 *acc = bpf_map_lookup_elem(&io_wait_ns, &pid);
             if (acc) {
-                __sync_fetch_and_add(acc, wait);
+                __atomic_fetch_add(acc, wait, __ATOMIC_RELAXED);
             } else {
                 bpf_map_update_elem(&io_wait_ns, &pid, &wait, BPF_ANY);
             }

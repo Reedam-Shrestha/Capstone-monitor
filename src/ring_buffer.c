@@ -42,6 +42,12 @@ static RingBuffer *rb_create_named(const char *name) {
     atomic_store(&rb->head, 0);
     atomic_store(&rb->tail, 0);
     /* capacity field removed — all paths use RB_CAPACITY compile-time constant */
+
+    /* Stamp the ABI this segment was created under.  Written once, here,
+     * at creation — never updated again, so it cannot drift the way a
+     * runtime capacity field could (see the comment on RingBuffer). */
+    rb->abi_version = MONITOR_ABI_VERSION;
+    rb->slot_size   = (uint32_t)sizeof(SmoothedMetrics);
     return rb;
 }
 
@@ -156,4 +162,22 @@ bool rb_is_full(const RingBuffer *rb) {
 
 bool rb_is_empty(const RingBuffer *rb) {
     return atomic_load(&rb->head) == atomic_load(&rb->tail);
+}
+
+/* ── ABI validation ───────────────────────────────────────────────────── */
+
+bool rb_check_abi(const RingBuffer *rb) {
+    if (rb->abi_version != MONITOR_ABI_VERSION ||
+        rb->slot_size    != (uint32_t)sizeof(SmoothedMetrics)) {
+        fprintf(stderr,
+            "[ring_buffer] ABI MISMATCH: shm segment was created with "
+            "abi_version=%u slot_size=%u bytes; this consumer was built "
+            "against abi_version=%u slot_size=%zu bytes.\n"
+            "  Rebuild this consumer against the current smoothed_metrics.h "
+            "before trusting any data from this segment.\n",
+            rb->abi_version, rb->slot_size,
+            (unsigned)MONITOR_ABI_VERSION, sizeof(SmoothedMetrics));
+        return false;
+    }
+    return true;
 }

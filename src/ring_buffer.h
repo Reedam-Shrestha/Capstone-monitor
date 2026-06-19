@@ -62,6 +62,14 @@ typedef struct {
      * constant was the root cause of the rb_pop/rb_is_full modulo-asymmetry
      * bug observed after stale shm reattach.
      */
+    uint32_t        abi_version; /* MONITOR_ABI_VERSION of the producer that
+                                   * created this segment. Written ONCE in
+                                   * rb_create*(), never touched again — does
+                                   * not participate in index/wrap math, so it
+                                   * cannot reintroduce the bug noted above. */
+    uint32_t        slot_size;   /* sizeof(SmoothedMetrics) of the producer.
+                                   * Catches a struct-layout skew even if a
+                                   * consumer forgot to bump ABI_VERSION. */
 } RingBuffer;
 
 /* ── Producer (schedmon daemon) ─────────────────────────────────────── */
@@ -84,5 +92,15 @@ void rb_detach       (RingBuffer *rb);   /* unmap only, no unlink            */
 
 bool rb_is_full (const RingBuffer *rb);
 bool rb_is_empty(const RingBuffer *rb);
+
+/*
+ * rb_check_abi — call once right after rb_attach*() / rb_attach_dash() /
+ * rb_attach_sched().  Returns true if this segment was created by a
+ * producer compiled against the same smoothed_metrics.h (same
+ * MONITOR_ABI_VERSION AND same sizeof(SmoothedMetrics)).  On mismatch,
+ * prints a diagnostic to stderr and returns false; the caller decides
+ * whether to refuse to run, retry, or degrade.
+ */
+bool rb_check_abi(const RingBuffer *rb);
 
 #endif /* RING_BUFFER_H */
