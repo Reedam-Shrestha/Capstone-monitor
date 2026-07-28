@@ -40,6 +40,7 @@ install: all
 	install -m 644 bpf/ctx_switch.bpf.o /opt/schedmon/bpf/
 	install -m 755 dashboard.py      /opt/schedmon/
 	install -m 755 calibrate.py      /opt/schedmon/
+	install -m 644 hw_profile.py     /opt/schedmon/
 
 clean:
 	rm -f schedmon bpf/ctx_switch.bpf.o

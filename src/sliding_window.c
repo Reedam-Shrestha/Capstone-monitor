@@ -21,10 +21,8 @@ void sw_push(SlidingWindow *sw, double sample) {
     sw->head             = (sw->head + 1) % SWAG_CAPACITY;
 
     /* Periodic exact recompute to prevent floating-point drift.
-     * After SWAG_CAPACITY^2 pushes (100 for N=10), accumulated rounding
-     * errors in run_sum can cause sw_mean() to diverge from the true mean.
-     * Recomputing from scratch every N^2 pushes costs one full buffer
-     * scan every 100 intervals (every 5 seconds at 50ms), negligible. */
+     * After SWAG_CAPACITY^2 pushes (100 for N=10), accumulated rounding errors in run_sum can cause sw_mean() to diverge from the true mean.
+     * scan every 100 intervals (every 5 seconds at 50ms), negligible*/
     if (++sw->push_count >= (uint32_t)(SWAG_CAPACITY * SWAG_CAPACITY)) {
         sw->push_count = 0;
         double exact = 0.0;

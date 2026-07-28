@@ -9,7 +9,7 @@
 #include <ctype.h>
 #include <stdint.h>
 
-/* ── Fast String Parser ────────────────────────────────────────────────── */
+/* Fast string parser*/
 /* Replaces sscanf by quickly jumping over space-separated fields */
 static inline const char* skip_fields(const char* p, int count) {
     for (int i = 0; i < count; i++) {
@@ -19,7 +19,7 @@ static inline const char* skip_fields(const char* p, int count) {
     return p;
 }
 
-/* ── Read /proc/PID/stat ───────────────────────────────────────────────── */
+/*Read /proc/PID/stat*/
 /* Optimization: only fetch comm if the process is newly discovered */
 static int read_proc_stat(int pid, ProcEntry *out, int fetch_comm) {
     char path[64];
@@ -102,7 +102,7 @@ void proc_scanner_init(ProcScanner *ps) {
     memset(ps, 0, sizeof(*ps));
 }
 
-/* ── proc_scanner_scan_pids (NEW: eBPF optimized) ──────────────────────── */
+/*proc_scanner_scan_pids */
 void proc_scanner_scan_pids(ProcScanner *ps, const uint32_t *pids, int num_pids) {
     for (int i = 0; i < ps->n_entries; i++)
         ps->entries[i].active = 0;
@@ -144,7 +144,7 @@ void proc_scanner_scan_pids(ProcScanner *ps, const uint32_t *pids, int num_pids)
     ps->scan_count++;
 }
 
-/* ── proc_scanner_scan (Fallback directory scan) ───────────────────────── */
+/*proc_scanner_scan*/
 void proc_scanner_scan(ProcScanner *ps) {
     for (int i = 0; i < ps->n_entries; i++)
         ps->entries[i].active = 0;

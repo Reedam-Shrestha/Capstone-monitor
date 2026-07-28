@@ -5,7 +5,7 @@
 
 #define PROC_MAX_TRACKED  1024   /* max PIDs we track for ranking */
 
-/* One entry per process — what we read from /proc/PID/stat */
+/*what we read from /proc/PID/stat */
 typedef struct {
     int      pid;
     char     comm[17];          /* process name, max 16 chars + null */

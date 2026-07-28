@@ -9,8 +9,8 @@
 #include <sys/syscall.h>
 #include <errno.h>
 #include <stdint.h>
+#include <stdbool.h>
 
-/* Grouped read buffer — same layout as perf_grouped.c */
 struct read_format {
     uint64_t nr;
     struct { uint64_t value; uint64_t id; } values[3];
@@ -22,8 +22,24 @@ static long perf_event_open(struct perf_event_attr *hw_event,
     return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
 
+/* prints a different message when we ran out of fds vs an actual pmu
+ * problem, since those need totally different fixes */
+static void report_open_failure(const char *what, pid_t pid, int cpu_id, int err) {
+    if (err == EMFILE || err == ENFILE) {
+        fprintf(stderr,
+            "perf_counter: FILE DESCRIPTOR LIMIT REACHED opening %s for pid=%d"
+            " (cpu=%d): %s\n"
+            "  not a pmu problem, raise ulimit -n or LimitNOFILE in the service file\n",
+            what, (int)pid, cpu_id, strerror(err));
+    } else {
+        fprintf(stderr, "perf_counter: %s failed for pid=%d (cpu=%d): %s\n",
+                what, (int)pid, cpu_id, strerror(err));
+    }
+}
+
 static int open_counter(uint32_t type, uint64_t config,
-                        pid_t pid, int cpu_id, int leader_fd) {
+                        pid_t pid, int cpu_id, int leader_fd,
+                        bool is_group_leader, int *out_errno) {
     struct perf_event_attr pe;
     memset(&pe, 0, sizeof(pe));
     pe.type       = type;
@@ -31,13 +47,16 @@ static int open_counter(uint32_t type, uint64_t config,
     pe.config     = config;
     pe.disabled   = 1;
     pe.exclude_hv = 1;
-    if (leader_fd == -1)
+    /* only set group format on the actual group leader. setting it on the
+     * lone software fallback counter makes the kernel return group-shaped
+     * reads instead of a plain u64 and breaks perf_counter_read for it */
+    if (is_group_leader)
         pe.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_ID;
-    /* cpu_id=-1: follow process anywhere; >=0: pin to that core */
     int fd = perf_event_open(&pe, pid, cpu_id, leader_fd, 0);
     if (fd == -1) {
-        fprintf(stderr, "perf_counter: open_counter failed (cpu=%d): %s\n",
-                cpu_id, strerror(errno));
+        if (out_errno) *out_errno = errno;
+    } else if (out_errno) {
+        *out_errno = 0;
     }
     return fd;
 }
@@ -45,32 +64,32 @@ static int open_counter(uint32_t type, uint64_t config,
 int perf_counter_open(perf_counter_t *pc, pid_t pid, int cpu_id) {
     memset(pc, 0, sizeof(*pc));
     pc->pid    = pid;
-    pc->cpu_id = cpu_id;   /* -1 = aggregate, >=0 = pinned core */
+    pc->cpu_id = cpu_id;
     pc->fd_cycles = pc->fd_instr = pc->fd_llc = -1;
-    pc->hw_available = 1;  /* assume hardware until proven otherwise */
+    pc->hw_available = 1;
 
+    int open_errno = 0;
     pc->fd_cycles = open_counter(PERF_TYPE_HARDWARE,
-                                 PERF_COUNT_HW_CPU_CYCLES, pid, cpu_id, -1);
+                                 PERF_COUNT_HW_CPU_CYCLES, pid, cpu_id, -1,
+                                 true, &open_errno);
     if (pc->fd_cycles < 0) {
-        /* Hardware PMU unavailable (VM, privilege, no PMU).
-         * Fall back to PERF_TYPE_SOFTWARE so the daemon can still run.
-         * IPC cannot be computed without real instruction counts —
-         * smoothed_ipc will be reported as 0.0 in degraded mode.
-         * smoothed_llc_miss will also be 0.0 (no LLC counter available).
-         * smoothed_ctx_freq and smoothed_io_freq are unaffected (eBPF). */
+        if (open_errno == EMFILE || open_errno == ENFILE) {
+            report_open_failure("hardware cycles counter", pid, cpu_id, open_errno);
+            pc->hw_available = 0;
+            return -1;
+        }
+
         fprintf(stderr, "perf_counter: hardware PMU unavailable for pid=%d"
                         " — falling back to software clock counter\n", (int)pid);
         pc->hw_available = 0;
 
         pc->fd_cycles = open_counter(PERF_TYPE_SOFTWARE,
-                                     PERF_COUNT_SW_CPU_CLOCK, pid, cpu_id, -1);
+                                     PERF_COUNT_SW_CPU_CLOCK, pid, cpu_id, -1,
+                                     false, &open_errno);
         if (pc->fd_cycles < 0) {
-            fprintf(stderr, "perf_counter: software fallback also failed"
-                            " for pid=%d\n", (int)pid);
+            report_open_failure("software fallback counter", pid, cpu_id, open_errno);
             return -1;
         }
-        /* In software-only mode we only have the clock counter — no instr
-         * or LLC fd.  Leave them at -1; perf_counter_read handles this. */
         ioctl(pc->fd_cycles, PERF_EVENT_IOC_RESET,  0);
         ioctl(pc->fd_cycles, PERF_EVENT_IOC_ENABLE, 0);
         return 0;
@@ -78,13 +97,23 @@ int perf_counter_open(perf_counter_t *pc, pid_t pid, int cpu_id) {
 
     pc->fd_instr  = open_counter(PERF_TYPE_HARDWARE,
                                  PERF_COUNT_HW_INSTRUCTIONS,
-                                 pid, cpu_id, pc->fd_cycles);
-    if (pc->fd_instr < 0)  { perf_counter_close(pc); return -1; }
+                                 pid, cpu_id, pc->fd_cycles,
+                                 false, &open_errno);
+    if (pc->fd_instr < 0) {
+        report_open_failure("instructions counter", pid, cpu_id, open_errno);
+        perf_counter_close(pc);
+        return -1;
+    }
 
     pc->fd_llc    = open_counter(PERF_TYPE_HARDWARE,
                                  PERF_COUNT_HW_CACHE_MISSES,
-                                 pid, cpu_id, pc->fd_cycles);
-    if (pc->fd_llc < 0)    { perf_counter_close(pc); return -1; }
+                                 pid, cpu_id, pc->fd_cycles,
+                                 false, &open_errno);
+    if (pc->fd_llc < 0) {
+        report_open_failure("LLC-misses counter", pid, cpu_id, open_errno);
+        perf_counter_close(pc);
+        return -1;
+    }
 
     ioctl(pc->fd_cycles, PERF_EVENT_IOC_ID, &pc->id_cycles);
     ioctl(pc->fd_instr,  PERF_EVENT_IOC_ID, &pc->id_instr);
@@ -99,10 +128,7 @@ int perf_counter_read(perf_counter_t *pc, raw_counters_t *out) {
     memset(out, 0, sizeof(*out));
 
     if (!pc->hw_available) {
-        /* Software fallback: single non-grouped fd, read as plain uint64_t.
-         * Only cycles (clock ticks) are available — instructions and LLC
-         * remain 0, so IPC and LLC miss rate will be 0.0 in the classifier.
-         * ctx_freq and io_freq via eBPF are unaffected. */
+        /* just cycles here, instr/llc stay 0 which makes ipc/llc_miss 0 too */
         uint64_t val = 0;
         if (read(pc->fd_cycles, &val, sizeof(val)) != (ssize_t)sizeof(val))
             return -1;
@@ -110,13 +136,8 @@ int perf_counter_read(perf_counter_t *pc, raw_counters_t *out) {
         return 0;
     }
 
-    /* Hardware path: grouped atomic read of all three counters */
     struct read_format buf;
     ssize_t n = read(pc->fd_cycles, &buf, sizeof(buf));
-    /* Reject short reads: if we can't even read the 'nr' field (8 bytes),
-     * buf.nr is garbage and the loop below would iterate arbitrary times.
-     * perf grouped reads are atomic in the kernel so a short read indicates
-     * a real fd error, not a partial transfer. */
     if (n < (ssize_t)sizeof(uint64_t))
         return -1;
 
@@ -130,11 +151,6 @@ int perf_counter_read(perf_counter_t *pc, raw_counters_t *out) {
     }
     return 0;
 }
-
-/* perf_counter_ipc() and perf_counter_llc_miss_rate() removed — dead code.
- * Both were never called from the sampling loop.  IPC and LLC miss rate
- * are computed inline in schedmon.c for correctness (window smoothing,
- * correct fraction vs percent semantics). */
 
 void perf_counter_close(perf_counter_t *pc) {
     if (pc->fd_cycles >= 0) {

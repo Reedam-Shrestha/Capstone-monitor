@@ -5,8 +5,6 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
-/* ── helpers ────────────────────────────────────────────────────────────── */
-
 static int find_map_fd(struct bpf_object *obj, const char *name) {
     struct bpf_map *map = bpf_object__find_map_by_name(obj, name);
     if (!map) {
@@ -33,8 +31,6 @@ static struct bpf_link *attach_prog(struct bpf_object *obj,
                 prog_name, strerror(errno));
     return link;
 }
-
-/* ── ebpf_tracer_load ───────────────────────────────────────────────────── */
 
 int ebpf_tracer_load(ebpf_tracer_t *et, const char *bpf_path) {
     memset(et, 0, sizeof(*et));
@@ -64,8 +60,8 @@ int ebpf_tracer_load(ebpf_tracer_t *et, const char *bpf_path) {
         return -1;
     }
 
-    /* Required maps — failure is fatal */
-    et->map_fd_switches = find_map_fd(et->obj, "vol_ctx_switches");
+    /* required maps */
+    et->map_fd_switches = find_map_fd(et->obj, "vol_ctx_switch");
     et->map_fd_pids     = find_map_fd(et->obj, "active_pids");
     if (et->map_fd_switches < 0 || et->map_fd_pids < 0) {
         bpf_object__close(et->obj);
@@ -107,8 +103,6 @@ int ebpf_tracer_load(ebpf_tracer_t *et, const char *bpf_path) {
     return 0;
 }
 
-/* ── ebpf_tracer_attach ─────────────────────────────────────────────────── */
-
 int ebpf_tracer_attach(ebpf_tracer_t *et) {
     if (!et->loaded) {
         fprintf(stderr, "[ebpf_tracer] Not loaded.\n");
@@ -124,29 +118,22 @@ int ebpf_tracer_attach(ebpf_tracer_t *et) {
         return -1;
     }
 
-    /* sched_wakeup — non-fatal; provides runqueue wait time */
+    /* these are all optional, just lose the corresponding metric if they fail */
     et->link_sched_wakeup = attach_prog(et->obj, "handle_sched_wakeup");
     if (!et->link_sched_wakeup)
-        fprintf(stderr, "[ebpf_tracer] sched_wakeup attach failed"
-                        " — rq_wait_ms will be 0 (non-fatal)\n");
+        fprintf(stderr, "[ebpf_tracer] sched_wakeup attach failed, rq_wait_ms will be 0\n");
 
-    /* block_rq_issue — non-fatal; needed for io_wait_ms */
     et->link_block_issue = attach_prog(et->obj, "handle_block_rq_issue");
     if (!et->link_block_issue)
-        fprintf(stderr, "[ebpf_tracer] block_rq_issue attach failed"
-                        " — io_wait_ms will be 0 (non-fatal)\n");
+        fprintf(stderr, "[ebpf_tracer] block_rq_issue attach failed, io_wait_ms will be 0\n");
 
-    /* block_rq_complete — non-fatal; needed for io_freq + io_wait_ms */
     et->link_block = attach_prog(et->obj, "handle_block_rq_complete");
     if (!et->link_block)
-        fprintf(stderr, "[ebpf_tracer] block_rq_complete attach failed"
-                        " — io_freq/io_wait_ms will be 0 (non-fatal)\n");
+        fprintf(stderr, "[ebpf_tracer] block_rq_complete attach failed, io_freq/io_wait_ms will be 0\n");
 
-    /* exec tracepoint — non-fatal */
     et->link_exec = attach_prog(et->obj, "handle_exec");
     if (!et->link_exec)
-        fprintf(stderr, "[ebpf_tracer] sched_process_exec attach failed"
-                        " — comm read from /proc (non-fatal)\n");
+        fprintf(stderr, "[ebpf_tracer] exec attach failed, comm read from /proc instead\n");
 
     printf("[ebpf_tracer] Attached: sched_switch + fork + exit%s%s%s%s\n",
            et->link_sched_wakeup ? " + sched_wakeup"      : "",
@@ -156,7 +143,6 @@ int ebpf_tracer_attach(ebpf_tracer_t *et) {
     return 0;
 }
 
-/* ── readers ────────────────────────────────────────────────────────────── */
 uint64_t ebpf_tracer_read_switches(const ebpf_tracer_t *et, uint32_t pid) {
     if (et->map_fd_switches < 0) return 0;
     uint64_t v = 0;
@@ -188,12 +174,8 @@ uint64_t ebpf_tracer_read_rq_wait_ns(const ebpf_tracer_t *et, uint32_t pid) {
     if (ret < 0) return 0;
     return v;
 }
-/*
- * ebpf_tracer_read_last_cpu — returns the last CPU id where pid ran,
- * or -1 if the map is unavailable or the pid has no entry yet.
- * This is read by the slow path to fill SmoothedMetrics.cpu_id for the
- * aggregate entry, giving ghOSt confirmed evidence of where the process ran.
- */
+/* last cpu the pid ran on, or -1. only used to detect changes for
+ * migration_freq, doesn't feed into cpu_id field anymore */
 int ebpf_tracer_read_last_cpu(const ebpf_tracer_t *et, uint32_t pid) {
     if (et->map_fd_last_cpu < 0) return -1;
     uint32_t cpu = 0;
@@ -201,8 +183,6 @@ int ebpf_tracer_read_last_cpu(const ebpf_tracer_t *et, uint32_t pid) {
         return -1;
     return (int)cpu;
 }
-
-/* ── ebpf_tracer_get_active_pids ────────────────────────────────────────── */
 
 int ebpf_tracer_get_active_pids(const ebpf_tracer_t *et,
                                 uint32_t *pids, int max_pids) {
@@ -225,8 +205,6 @@ int ebpf_tracer_get_active_pids(const ebpf_tracer_t *et,
     return 0;
 }
 
-/* ── ebpf_tracer_pop_exec_comm ──────────────────────────────────────────── */
-
 int ebpf_tracer_pop_exec_comm(const ebpf_tracer_t *et,
                               uint32_t pid, char *buf, int len) {
     if (et->map_fd_exec < 0 || !buf || len <= 0)
@@ -246,39 +224,25 @@ int ebpf_tracer_pop_exec_comm(const ebpf_tracer_t *et,
     return 1;
 }
 
-/* ── ebpf_tracer_register_pid ───────────────────────────────────────────────
- * Insert pid into the BPF active_pids map from userspace.
- * Called by add_pid() so pre-existing processes and explicitly listed PIDs
- * are visible to the block_rq_issue/complete tracepoints.
- * Also initialises io_counts, io_wait_ns and rq_wait_ns to 0 if not present,
- * mirroring what handle_fork does for newly created processes.
- */
+/* mark pid active in bpf so pre-existing procs (started before daemon, or
+ * passed via --pids) show up for block io tracepoints too. also zeros the
+ * counters if they arent already set */
 void ebpf_tracer_register_pid(const ebpf_tracer_t *et, uint32_t pid) {
     if (et->map_fd_pids < 0) return;
 
     uint32_t active = 1;
     bpf_map_update_elem(et->map_fd_pids, &pid, &active, BPF_ANY);
 
-    /* Initialise counters to 0 if not already present (BPF_NOEXIST so we
-     * don't reset counters for a process that was already being tracked by
-     * the fork/exec tracepoints before userspace caught up). */
     uint64_t zero = 0;
     if (et->map_fd_io      >= 0) bpf_map_update_elem(et->map_fd_io,      &pid, &zero, BPF_NOEXIST);
     if (et->map_fd_io_wait >= 0) bpf_map_update_elem(et->map_fd_io_wait, &pid, &zero, BPF_NOEXIST);
     if (et->map_fd_rq_wait >= 0) bpf_map_update_elem(et->map_fd_rq_wait, &pid, &zero, BPF_NOEXIST);
 }
 
-/* ── ebpf_tracer_unregister_pid ─────────────────────────────────────────────
- * Remove pid from the BPF active_pids map when the monitor stops tracking it.
- * Does NOT delete the counter maps — the final delta was already consumed by
- * remove_slot before this is called.
- */
 void ebpf_tracer_unregister_pid(const ebpf_tracer_t *et, uint32_t pid) {
     if (et->map_fd_pids < 0) return;
     bpf_map_delete_elem(et->map_fd_pids, &pid);
 }
-
-/* ── ebpf_tracer_destroy ────────────────────────────────────────────────── */
 
 void ebpf_tracer_destroy(ebpf_tracer_t *et) {
     if (et->link_sched_switch) { bpf_link__destroy(et->link_sched_switch); et->link_sched_switch = NULL; }

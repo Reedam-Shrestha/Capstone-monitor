@@ -8,35 +8,38 @@ import os, sys, time, mmap, struct, ctypes, argparse
 from dataclasses import dataclass, field
 from typing import Dict
 
+try:
+    import hw_profile
+except ImportError:
+    hw_profile = None
+
 from rich.console import Console
 from rich.table   import Table
 from rich.live    import Live
 from rich.panel   import Panel
 from rich         import box
 
-# ── Ring buffer constants — must match ring_buffer.h + smoothed_metrics.h ──
-#
-# SmoothedMetrics v4 layout (sizeof == 72):
-#   offset  0  int      pid
-#   offset  4  int      cpu_id
-#   offset  8  uint64   timestamp_ns
-#   offset 16  double   smoothed_ipc
-#   offset 24  double   smoothed_llc_miss
-#   offset 32  double   smoothed_ctx_freq
-#   offset 40  double   smoothed_io_freq
-#   offset 48  double   smoothed_io_wait_ms
-#   offset 56  double   smoothed_rq_wait_ms
-#   offset 64  double   smoothed_migration_freq
-#
-MONITOR_ABI_VERSION = 4   # must match smoothed_metrics.h
-SLOT                = 72  # sizeof(SmoothedMetrics)
-CAP                 = 32768  # RB_CAPACITY
+# ring buffer layout, must match ring_buffer.h + smoothed_metrics.h
+# SmoothedMetrics (88 bytes):
+#   0  pid
+#   4  cpu_id
+#   8  hw_pmu_available
+#   16 timestamp_ns
+#   24 smoothed_ipc
+#   32 smoothed_llc_miss
+#   40 smoothed_ctx_freq
+#   48 smoothed_io_freq
+#   56 smoothed_io_wait_ms
+#   64 smoothed_rq_wait_ms
+#   72 smoothed_migration_freq
+#   80 smoothed_io_syscall_freq
+MONITOR_ABI_VERSION = 5
+SLOT                = 88
+CAP                 = 32768
 
 SHM_PATH = "/dev/shm/monitor_rb_dash"
 
-# Trailing ABI header written once by rb_create*() in ring_buffer.c (H1 fix).
-# Offsets must match the RingBuffer struct layout exactly:
-#   slots[CAP] | head (4B) | tail (4B) | abi_version (4B) | slot_size (4B)
+# trailing header: slots[CAP] | head(4) | tail(4) | abi_version(4) | slot_size(4)
 _SLOTS_SZ      = SLOT * CAP
 _ABI_OFF       = _SLOTS_SZ + 8
 _SLOT_SIZE_OFF = _SLOTS_SZ + 12
@@ -44,18 +47,15 @@ _SLOT_SIZE_OFF = _SLOTS_SZ + 12
 _abi_warned = False
 
 def check_shm_abi(mm) -> bool:
-    """
-    Validate the live shm segment was created by a producer compiled
-    against this same smoothed_metrics.h.  Prints once on mismatch
-    (not every refresh) and returns False so callers can decide whether
-    to keep reading (degraded) or bail.
-    """
+    """checks the shm segment was made by a producer with matching abi.
+    warns once, not every refresh, returns False so caller decides
+    whether to keep reading anyway or bail"""
     global _abi_warned
     try:
         live_abi  = int.from_bytes(mm[_ABI_OFF:_ABI_OFF+4], 'little')
         live_slot = int.from_bytes(mm[_SLOT_SIZE_OFF:_SLOT_SIZE_OFF+4], 'little')
     except Exception:
-        return True  # segment too small (older daemon, pre-H1-fix) — skip, don't false-alarm
+        return True  # segment too small, probably an old daemon, dont false alarm
 
     ok = (live_abi == MONITOR_ABI_VERSION) and (live_slot == SLOT)
     if not ok and not _abi_warned:
@@ -70,6 +70,7 @@ class SmoothedMetrics(ctypes.Structure):
     _fields_ = [
         ("pid",                    ctypes.c_int),
         ("cpu_id",                 ctypes.c_int),
+        ("hw_pmu_available",       ctypes.c_int),
         ("timestamp_ns",           ctypes.c_uint64),
         ("smoothed_ipc",           ctypes.c_double),
         ("smoothed_llc_miss",      ctypes.c_double),
@@ -78,19 +79,36 @@ class SmoothedMetrics(ctypes.Structure):
         ("smoothed_io_wait_ms",    ctypes.c_double),
         ("smoothed_rq_wait_ms",    ctypes.c_double),
         ("smoothed_migration_freq",ctypes.c_double),
+        ("smoothed_io_syscall_freq",ctypes.c_double),
     ]
 
 assert ctypes.sizeof(SmoothedMetrics) == SLOT, \
     f"SmoothedMetrics C size mismatch: expected {SLOT}, got {ctypes.sizeof(SmoothedMetrics)}"
 
-# ── Threshold loader ─────────────────────────────────────────────────────────
 _CONF_PATH = os.path.expanduser("~/.config/schedmon/thresholds.conf")
-_DEFAULTS  = {
+
+# mainstream core defaults, used until hw_profile or thresholds.conf says otherwise
+_DEFAULTS = {
     "ipc_cpu_threshold": 1.2,
     "ipc_mem_threshold": 0.8,
     "llc_mem_threshold": 0.02,
     "ctx_io_threshold":  500.0,
+    "ipc_idle_threshold":        0.05,
+    "io_wait_bound_threshold":   5.0,
+    "rq_wait_starved_threshold": 2.0,
 }
+
+# on narrow issue cpus (celeron n/j series etc) ipc_cpu_threshold=1.2 is
+# basically unreachable so cpu-bound would never trigger before the
+# first calibration run happens
+if hw_profile is not None:
+    _detected_model = hw_profile.read_cpu_model()
+    if hw_profile.is_narrow_issue_cpu(_detected_model):
+        _DEFAULTS["ipc_cpu_threshold"] = hw_profile.NARROW_ISSUE_IPC_CEILING
+        _DEFAULTS["ipc_mem_threshold"] = round(
+            hw_profile.NARROW_ISSUE_IPC_CEILING * 0.7, 4)
+        _DEFAULTS["ipc_idle_threshold"] = round(
+            _DEFAULTS["ipc_mem_threshold"] * 0.15, 4)
 
 def load_thresholds() -> dict:
     t = dict(_DEFAULTS)
@@ -113,14 +131,14 @@ _thresholds   = load_thresholds()
 _thresh_mtime = 0.0
 
 
-# ── Workload classifier (display-only — Bigyan's is authoritative) ───────────
 def classify(ipc: float, llc_miss: float, ctx_freq: float,
-             io_wait_ms: float, rq_wait_ms: float):
-    """
-    Rule-based classifier for the dashboard display.
-    Labelled 'Est.Workload' to distinguish from Bigyan's authoritative classifier.
-    Re-reads thresholds.conf on disk change (live recalibration).
-    """
+             io_wait_ms: float, rq_wait_ms: float, hw_pmu_available: bool = True):
+    """rule based classifier for display, labelled 'Est.Workload' since
+    this isnt the authoritative classifier. rereads thresholds.conf on
+    change so recalibrating updates live.
+
+    when hw_pmu_available is False, ipc/llc_miss are always 0 because the
+    software fallback cant count instructions -- dont read that as idle"""
     global _thresholds, _thresh_mtime
     try:
         mt = os.path.getmtime(_CONF_PATH)
@@ -132,27 +150,27 @@ def classify(ipc: float, llc_miss: float, ctx_freq: float,
 
     t = _thresholds
 
-    # I/O-bound: prioritise io_wait_ms (latency) over ctx_freq (throughput)
-    # A process blocked on slow I/O has high wait even with moderate ctx rate.
-    if io_wait_ms > 5.0 or ctx_freq > t["ctx_io_threshold"]:
+    # io wait first since its a stronger signal than ctx_freq alone, both
+    # come from ebpf/proc so still valid even without pmu access
+    if io_wait_ms > t["io_wait_bound_threshold"] or ctx_freq > t["ctx_io_threshold"]:
         return "IO-BOUND",  "red"
 
-    # CPU-starved: process wants CPU (high IPC when it runs) but is waiting
-    # for cores (high rq_wait_ms).  Distinct from CPU-BOUND which has low wait.
-    # Signal for Prabhakar: this process should migrate to a less loaded core.
-    if ipc > t["ipc_cpu_threshold"] and rq_wait_ms > 2.0:
+    if not hw_pmu_available:
+        return "UNKNOWN",   "dim"
+
+    # wants cpu but cant get scheduled onto one, different from just cpu bound
+    if ipc > t["ipc_cpu_threshold"] and rq_wait_ms > t["rq_wait_starved_threshold"]:
         return "CPU-STARVED", "bright_red"
 
     if ipc > t["ipc_cpu_threshold"] and ctx_freq < t["ctx_io_threshold"]:
         return "CPU-BOUND", "green"
     if llc_miss > t["llc_mem_threshold"] and ipc < t["ipc_mem_threshold"]:
         return "MEM-BOUND", "yellow"
-    if ipc < 0.05:
+    if ipc < t["ipc_idle_threshold"]:
         return "IDLE",      "dim"
     return "MIXED",         "blue"
 
 
-# ── Ring buffer drain ────────────────────────────────────────────────────────
 def drain_ring_buffer() -> Dict[int, SmoothedMetrics]:
     result: Dict[int, SmoothedMetrics] = {}
     if not os.path.exists(SHM_PATH):
@@ -167,10 +185,8 @@ def drain_ring_buffer() -> Dict[int, SmoothedMetrics]:
     except Exception:
         return result
 
-    # H1 fix: validate the daemon that created this segment matches the
-    # ABI this script was written against. Warns once on mismatch; does
-    # not block reading (a misread sample is preferable to a dead dashboard,
-    # but the warning makes the misread visible instead of silent).
+    # warns once on mismatch but doesnt stop reading, a misread sample
+    # beats a dead dashboard, this just makes it visible
     check_shm_abi(mm)
 
     try:
@@ -185,11 +201,11 @@ def drain_ring_buffer() -> Dict[int, SmoothedMetrics]:
             offset = idx * SLOT
             chunk  = bytes(mm[offset:offset+SLOT])
 
-            pid = int.from_bytes(chunk[0:4],  'little', signed=True)
-            ts  = int.from_bytes(chunk[8:16], 'little')
+            pid = int.from_bytes(chunk[0:4],   'little', signed=True)
+            ts  = int.from_bytes(chunk[16:24], 'little')
 
             if 0 < pid < 4194304 and ts > 0:
-                ipc = struct.unpack_from('d', chunk, 16)[0]
+                ipc = struct.unpack_from('d', chunk, 24)[0]
                 if 0.0 <= ipc <= 20.0:
                     m = SmoothedMetrics.from_buffer_copy(chunk)
                     if pid not in result or ts > result[pid].timestamp_ns:
@@ -208,7 +224,6 @@ def drain_ring_buffer() -> Dict[int, SmoothedMetrics]:
     return result
 
 
-# ── /proc helpers ────────────────────────────────────────────────────────────
 def read_proc_stat(pid: int):
     try:
         with open(f"/proc/{pid}/stat") as f:
@@ -235,7 +250,6 @@ def read_proc_status(pid: int):
     return rss_kb, threads
 
 
-# ── Per-PID display state ────────────────────────────────────────────────────
 @dataclass
 class PidInfo:
     pid:            int   = 0
@@ -244,6 +258,7 @@ class PidInfo:
     rss_mb:         float = 0.0
     threads:        int   = 0
     cpu_id:         int   = -1
+    hw_pmu_available: bool = True
     ipc:            float = 0.0
     llc_miss:       float = 0.0
     ctx_freq:       float = 0.0
@@ -251,12 +266,12 @@ class PidInfo:
     io_wait_ms:     float = 0.0
     rq_wait_ms:     float = 0.0
     migration_freq: float = 0.0
+    io_syscall_freq: float = 0.0
     prev_ticks:     int   = 0
     seen:           bool  = False
     last_seen:      float = field(default_factory=time.time)
 
 
-# ── Dashboard ────────────────────────────────────────────────────────────────
 class Dashboard:
     def __init__(self, top_n: int, interval: float, sort_by: str = "cpu",
                  show_zero: bool = False):
@@ -292,6 +307,7 @@ class Dashboard:
             info.seen        = True
             info.last_seen   = now
             info.cpu_id      = m.cpu_id
+            info.hw_pmu_available = bool(m.hw_pmu_available)
 
             delta            = total_ticks - info.prev_ticks
             info.cpu_pct     = (delta / (self.interval * self.hz)) * 100 / self.ncores
@@ -304,6 +320,7 @@ class Dashboard:
             info.io_wait_ms     = m.smoothed_io_wait_ms
             info.rq_wait_ms     = m.smoothed_rq_wait_ms
             info.migration_freq = m.smoothed_migration_freq
+            info.io_syscall_freq = m.smoothed_io_syscall_freq
 
         for pid in list(self.state.keys()):
             if not self.state[pid].seen:
@@ -319,13 +336,13 @@ class Dashboard:
 
         rows = sorted(self.state.values(), key=sort_key, reverse=True)
 
-        # Filter all-zero entries unless --zero/-z was passed.
-        # "Active" means at least one perf metric is non-zero.
+        # only show active rows unless --zero
         if not self.show_zero:
             rows = [r for r in rows if
                     r.ipc > 0.0 or r.llc_miss > 0.0 or r.ctx_freq > 0.0
                     or r.io_freq > 0.0 or r.io_wait_ms > 0.0
-                    or r.rq_wait_ms > 0.0 or r.migration_freq > 0.0]
+                    or r.rq_wait_ms > 0.0 or r.migration_freq > 0.0
+                    or r.io_syscall_freq > 0.0]
 
         if self.top_n > 0:
             rows = rows[:self.top_n]
@@ -356,18 +373,19 @@ class Dashboard:
         table.add_column("LLC%",         style="magenta",   width=8,  justify="right")
         table.add_column("ctx/s",        style="red",       width=8,  justify="right")
         table.add_column("io B/s",       style="cyan",      width=9,  justify="right")
+        table.add_column("sys B/s",      style="blue",      width=9,  justify="right")
         table.add_column("io_wait",      style="magenta",   width=9,  justify="right")
         table.add_column("rq_wait",      style="yellow",    width=9,  justify="right")
         table.add_column("mig/s",        style="cyan",      width=7,  justify="right")
         table.add_column("Est.Workload", width=12)
 
-        has_per_core = any(i.cpu_id >= 0 for i in rows)
-        if has_per_core:
-            table.add_column("Core", style="dim", width=5, justify="right")
+        # no core column, daemon only emits aggregate entries (cpu_id -1)
+        # since per-core got dropped, none of our schedulers need it anyway
 
         for info in rows:
             label, color = classify(info.ipc, info.llc_miss, info.ctx_freq,
-                                    info.io_wait_ms, info.rq_wait_ms)
+                                    info.io_wait_ms, info.rq_wait_ms,
+                                    info.hw_pmu_available)
 
             if info.cpu_pct > 80:
                 cpu_str = f"[bold red]{info.cpu_pct:5.1f}[/]"
@@ -384,7 +402,7 @@ class Dashboard:
                            if info.rq_wait_ms > 2.0
                            else f"{info.rq_wait_ms:6.1f}ms")
 
-            # Format io_freq as bytes/sec with K/M suffix for readability
+            # k/m suffix for readability
             io_b = info.io_freq
             if io_b >= 1048576:
                 io_str = f"{io_b/1048576:5.1f}M"
@@ -393,7 +411,18 @@ class Dashboard:
             else:
                 io_str = f"{io_b:5.0f}B"
 
-            # Highlight high migration rate in cyan — indicates scheduler bouncing
+            # same formatting, this is usually higher than io B/s for
+            # cache-hot processes which is fine, counts syscall bytes not
+            # just physical disk bytes
+            sys_b = info.io_syscall_freq
+            if sys_b >= 1048576:
+                sys_str = f"{sys_b/1048576:5.1f}M"
+            elif sys_b >= 1024:
+                sys_str = f"{sys_b/1024:5.1f}K"
+            else:
+                sys_str = f"{sys_b:5.0f}B"
+
+            # cyan highlight if bouncing between cores a lot
             mig_str = (f"[bold cyan]{info.migration_freq:5.1f}[/]"
                        if info.migration_freq > 10.0
                        else f"{info.migration_freq:5.1f}")
@@ -408,13 +437,12 @@ class Dashboard:
                 f"{info.llc_miss*100:.3f}",
                 f"{info.ctx_freq:,.0f}",
                 io_str,
+                sys_str,
                 io_wait_str,
                 rq_wait_str,
                 mig_str,
                 f"[{color}]{label}[/]",
             ]
-            if has_per_core:
-                _row.append(str(info.cpu_id) if info.cpu_id >= 0 else "agg")
             table.add_row(*_row)
 
         total = len(self.state)
@@ -428,7 +456,6 @@ class Dashboard:
         )
 
 
-# ── Entry point ──────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--top",      type=int,   default=20)
